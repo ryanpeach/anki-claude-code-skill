@@ -46,12 +46,19 @@ The `dedupe` skill additionally needs [Deno](https://deno.land) installed to run
 
 The `dedupe` skill finds repeated cards. A [Deno](https://deno.land) script vector-indexes the deck, computes pairwise cosine similarity, and surfaces every note pair scoring at or above a **target** you choose (default `0.80`). Claude then reads each candidate pair and makes the final call — true duplicate, intentional reverse card, overlapping-but-distinct, or false positive — and offers to delete, suspend, or merge the redundant note (never without your confirmation).
 
-- **Local by default** — TF-IDF vectorization runs entirely on your machine, no API key.
-- **Optional semantic mode** — pass through to an OpenAI-compatible embeddings endpoint (`--method openai`, needs `OPENAI_API_KEY`) to catch paraphrases that share few literal words.
+- **Local by default** — TF-IDF vectorization runs entirely on your machine, no API key, no model download.
+- **Vendor-agnostic semantic mode** — for paraphrases that share few literal words, switch to real embeddings via the [Vercel AI SDK](https://www.npmjs.com/package/ai). Pick your provider:
+  - `--method ollama` — local, private, no key ([Ollama](https://ollama.com), default model `nomic-embed-text`)
+  - `--method openai` — needs `OPENAI_API_KEY`
+  - `--method openrouter` — needs `OPENROUTER_API_KEY`
+  - or any other OpenAI-compatible endpoint via `--base-url` / `--api-key-env` / `--model`
+- **Cached** — embeddings are cached on disk keyed by note text, so re-auditing a deck only embeds new or changed cards (fast, and nearly free on paid APIs). `--no-cache` to disable.
 - **Markup-aware** — HTML, cloze `{{c1::…}}`, and media refs are stripped before comparison, so cards match on meaning.
 
 ```
-/dedupe Spanish::Vocab 0.85
+/dedupe Spanish::Vocab 0.85          # local TF-IDF
+# semantic, local via Ollama:
+deno run -A .claude/skills/dedupe/scripts/dedupe.ts --deck Spanish::Vocab --method ollama --target 0.88
 ```
 
 ## How it works

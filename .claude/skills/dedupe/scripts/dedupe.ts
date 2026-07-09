@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-net --allow-env
+#!/usr/bin/env -S deno run -A
 /**
  * dedupe.ts — Vector-index an Anki deck and surface near-duplicate note pairs.
  *
@@ -10,34 +10,93 @@
  * duplicate. That final judgment is left to Claude Code, which inspects the
  * emitted pairs semantically.
  *
- * Two vectorization backends:
+ * Vectorization backends (--method):
  *   tfidf  (default) — TF-IDF over word uni/bigrams. Zero setup, fully local,
  *                      great at catching reworded / near-identical cards.
- *   openai           — Real semantic embeddings via an OpenAI-compatible
- *                      /v1/embeddings endpoint. Catches paraphrases that share
- *                      few words. Requires OPENAI_API_KEY.
+ *   ollama           — Local semantic embeddings via Ollama's OpenAI-compatible
+ *                      endpoint (http://localhost:11434/v1). No API key needed.
+ *   openai           — Semantic embeddings via the OpenAI API. Needs OPENAI_API_KEY.
+ *   openrouter       — Semantic embeddings via OpenRouter. Needs OPENROUTER_API_KEY.
+ *
+ * The last three all speak the OpenAI /v1/embeddings protocol; they differ only
+ * in default base URL, default model, and which env var holds the key. Override
+ * any of it with --base-url / --model / --api-key-env.
  *
  * Usage:
- *   deno run --allow-net --allow-env dedupe.ts --deck "Spanish::Vocab" --target 0.8
- *   deno run --allow-net --allow-env dedupe.ts --query "deck:Spanish tag:verbs" --target 0.85
- *   deno run --allow-net --allow-env dedupe.ts --deck "Spanish" --method openai --target 0.9
+ *   deno run -A dedupe.ts --deck "Spanish::Vocab" --target 0.8
+ *   deno run -A dedupe.ts --query "deck:Spanish tag:verbs" --target 0.85
+ *   deno run -A dedupe.ts --deck "Spanish" --method ollama --target 0.88
+ *   deno run -A dedupe.ts --deck "Spanish" --method openrouter --model openai/text-embedding-3-small
  *
  * Flags:
- *   --deck <name>      Deck to scan (quoted). Shorthand for --query 'deck:"<name>"'.
- *   --query <query>    Raw Anki search query (overrides --deck).
- *   --target <float>   Similarity threshold in [0,1]. Default 0.80.
- *   --method <name>    tfidf | openai. Default tfidf.
- *   --top <int>        Cap output to the N highest-scoring pairs.
- *   --max-snippet <n>  Chars of note text shown per side in text output. Default 160.
- *   --anki-url <url>   AnkiConnect endpoint. Default http://localhost:8765.
- *   --model <name>     Embedding model for --method openai. Default text-embedding-3-small.
- *   --json             Emit JSON only (for programmatic consumption by Claude).
- *   --help             Show this help.
+ *   --deck <name>       Deck to scan (quoted). Shorthand for --query 'deck:"<name>"'.
+ *   --query <query>     Raw Anki search query (overrides --deck).
+ *   --target <float>    Similarity threshold in [0,1]. Default 0.80.
+ *   --method <name>     tfidf | ollama | openai | openrouter. Default tfidf.
+ *   --top <int>         Cap output to the N highest-scoring pairs.
+ *   --max-snippet <n>   Chars of note text shown per side in text output. Default 160.
+ *   --anki-url <url>    AnkiConnect endpoint. Default http://localhost:8765.
+ *   --model <name>      Embedding model. Defaults per method (see below).
+ *   --base-url <url>    Override the embeddings endpoint base (…/v1).
+ *   --api-key-env <var> Env var to read the API key from. Default per method.
+ *   --cache <path>      Embedding cache file. Default ~/.cache/anki-dedupe/embeddings.json.
+ *   --no-cache          Disable the embedding cache (always re-embed).
+ *   --json              Emit JSON only (for programmatic consumption by Claude).
+ *   --help              Show this help.
+ *
+ * Caching: embedding vectors are cached on disk keyed by a hash of
+ * "<method>:<model>" + note text, so re-running only embeds notes that are new
+ * or changed. TF-IDF needs no cache (it is local and instant).
+ *
+ * Per-method defaults:
+ *   ollama      base http://localhost:11434/v1   key (none)          model nomic-embed-text
+ *   openai      base https://api.openai.com/v1   key OPENAI_API_KEY   model text-embedding-3-small
+ *   openrouter  base https://openrouter.ai/api/v1 key OPENROUTER_API_KEY model openai/text-embedding-3-small
  *
  * Environment:
- *   OPENAI_API_KEY     Required for --method openai.
- *   OPENAI_BASE_URL    Optional. Default https://api.openai.com/v1.
+ *   OPENAI_API_KEY / OPENROUTER_API_KEY  API key for the chosen method.
+ *   <method>_BASE_URL (e.g. OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL)
+ *                      Override the base URL without a flag.
  */
+
+import { embedMany } from "npm:ai@^7";
+import { createOpenAICompatible } from "npm:@ai-sdk/openai-compatible@^3";
+
+// ---------------------------------------------------------------------------
+// Provider presets — the embedding methods all speak the OpenAI /v1/embeddings
+// protocol and differ only in these three fields.
+// ---------------------------------------------------------------------------
+
+type Method = "tfidf" | "ollama" | "openai" | "openrouter";
+type EmbedMethod = Exclude<Method, "tfidf">;
+
+interface Preset {
+  baseUrl: string;
+  baseUrlEnv: string;
+  keyEnv: string | null; // null ⇒ no API key required (Ollama)
+  model: string;
+}
+
+const PRESETS: Record<EmbedMethod, Preset> = {
+  ollama: {
+    baseUrl: "http://localhost:11434/v1",
+    baseUrlEnv: "OLLAMA_BASE_URL",
+    keyEnv: null,
+    model: "nomic-embed-text",
+  },
+  openai: {
+    baseUrl: "https://api.openai.com/v1",
+    baseUrlEnv: "OPENAI_BASE_URL",
+    keyEnv: "OPENAI_API_KEY",
+    model: "text-embedding-3-small",
+  },
+  openrouter: {
+    baseUrl: "https://openrouter.ai/api/v1",
+    baseUrlEnv: "OPENROUTER_BASE_URL",
+    keyEnv: "OPENROUTER_API_KEY",
+    model: "openai/text-embedding-3-small",
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -47,11 +106,15 @@ interface Args {
   deck?: string;
   query?: string;
   target: number;
-  method: "tfidf" | "openai";
+  method: Method;
   top?: number;
   maxSnippet: number;
   ankiUrl: string;
-  model: string;
+  model?: string;      // undefined ⇒ use the method's preset default
+  baseUrl?: string;    // undefined ⇒ preset default / env
+  apiKeyEnv?: string;  // undefined ⇒ preset default
+  cache: boolean;
+  cachePath?: string;  // undefined ⇒ default path
   json: boolean;
 }
 
@@ -61,9 +124,10 @@ function parseArgs(argv: string[]): Args {
     method: "tfidf",
     maxSnippet: 160,
     ankiUrl: "http://localhost:8765",
-    model: "text-embedding-3-small",
+    cache: true,
     json: false,
   };
+  const methods: Method[] = ["tfidf", "ollama", "openai", "openrouter"];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => {
@@ -77,14 +141,20 @@ function parseArgs(argv: string[]): Args {
       case "--target": a.target = Number(next()); break;
       case "--method": {
         const m = next();
-        if (m !== "tfidf" && m !== "openai") die(`Unknown --method: ${m}`);
-        a.method = m;
+        if (!methods.includes(m as Method)) {
+          die(`Unknown --method: ${m}. Use one of: ${methods.join(", ")}.`);
+        }
+        a.method = m as Method;
         break;
       }
       case "--top": a.top = parseInt(next(), 10); break;
       case "--max-snippet": a.maxSnippet = parseInt(next(), 10); break;
       case "--anki-url": a.ankiUrl = next(); break;
       case "--model": a.model = next(); break;
+      case "--base-url": a.baseUrl = next(); break;
+      case "--api-key-env": a.apiKeyEnv = next(); break;
+      case "--cache": a.cache = true; a.cachePath = next(); break;
+      case "--no-cache": a.cache = false; break;
       case "--json": a.json = true; break;
       case "--help": case "-h": printHelpAndExit(); break;
       default: die(`Unknown argument: ${arg}`);
@@ -275,42 +345,126 @@ function tfidfPairs(
 }
 
 // ---------------------------------------------------------------------------
-// OpenAI-compatible embeddings + dense cosine similarity
+// Semantic embeddings (Ollama / OpenAI / OpenRouter) via the Vercel AI SDK,
+// with an on-disk cache + dense cosine similarity.
 // ---------------------------------------------------------------------------
 
-async function embed(texts: string[], model: string): Promise<Float64Array[]> {
-  const key = Deno.env.get("OPENAI_API_KEY");
-  if (!key) die("--method openai requires OPENAI_API_KEY in the environment.");
-  const base = (Deno.env.get("OPENAI_BASE_URL") ?? "https://api.openai.com/v1")
+interface EmbedConfig {
+  method: EmbedMethod;
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+  cachePath?: string; // undefined ⇒ caching disabled
+}
+
+/** Resolve flags + env + presets into a concrete embedding configuration. */
+function resolveEmbedConfig(args: Args): EmbedConfig {
+  const method = args.method as EmbedMethod;
+  const preset = PRESETS[method];
+  const model = args.model ?? preset.model;
+  const baseUrl = (args.baseUrl ?? Deno.env.get(preset.baseUrlEnv) ?? preset.baseUrl)
     .replace(/\/$/, "");
 
-  const vectors: Float64Array[] = [];
-  const BATCH = 128;
-  for (let i = 0; i < texts.length; i += BATCH) {
-    const batch = texts.slice(i, i + BATCH).map((t) => t || " ");
-    const resp = await fetch(`${base}/embeddings`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${key}`,
-      },
-      body: JSON.stringify({ model, input: batch }),
-    });
-    if (!resp.ok) {
-      die(`Embeddings API HTTP ${resp.status}: ${(await resp.text()).slice(0, 300)}`);
-    }
-    const data = await resp.json() as { data: { embedding: number[] }[] };
-    for (const row of data.data) {
-      const v = Float64Array.from(row.embedding);
-      let norm = 0;
-      for (const x of v) norm += x * x;
-      norm = Math.sqrt(norm) || 1;
-      for (let k = 0; k < v.length; k++) v[k] /= norm;
-      vectors.push(v);
-    }
-    console.error(`  embedded ${Math.min(i + BATCH, texts.length)}/${texts.length}`);
+  const keyEnv = args.apiKeyEnv ?? preset.keyEnv;
+  const apiKey = keyEnv ? Deno.env.get(keyEnv) ?? undefined : undefined;
+  if (keyEnv && !apiKey) {
+    die(`--method ${method} needs an API key. Set ${keyEnv} (or pass --api-key-env).`);
   }
-  return vectors;
+
+  let cachePath: string | undefined;
+  if (args.cache) cachePath = args.cachePath ?? defaultCachePath();
+
+  return { method, baseUrl, model, apiKey, cachePath };
+}
+
+function defaultCachePath(): string {
+  const home = Deno.env.get("HOME") ?? Deno.env.get("USERPROFILE") ?? ".";
+  return `${home}/.cache/anki-dedupe/embeddings.json`;
+}
+
+/** Stable cache key for a (namespace, text) pair. */
+async function cacheKey(ns: string, text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(`${ns}\u0000${text}`);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+type Cache = Record<string, number[]>;
+
+function loadCache(path: string): Cache {
+  try {
+    return JSON.parse(Deno.readTextFileSync(path)) as Cache;
+  } catch {
+    return {}; // missing or corrupt cache → start fresh
+  }
+}
+
+function saveCache(path: string, cache: Cache): void {
+  try {
+    const dir = path.replace(/\/[^/]*$/, "");
+    if (dir && dir !== path) Deno.mkdirSync(dir, { recursive: true });
+    Deno.writeTextFileSync(path, JSON.stringify(cache));
+  } catch (e) {
+    console.error(`  warning: could not write cache (${(e as Error).message})`);
+  }
+}
+
+function unit(raw: number[]): Float64Array {
+  const v = Float64Array.from(raw);
+  let norm = 0;
+  for (const x of v) norm += x * x;
+  norm = Math.sqrt(norm) || 1;
+  for (let k = 0; k < v.length; k++) v[k] /= norm;
+  return v;
+}
+
+/**
+ * Embed texts, reusing cached vectors and only calling the provider for cache
+ * misses. Cached vectors are keyed by SHA-256 of "<method>:<model>\0<text>", so
+ * unchanged notes are never re-embedded and switching model/provider is safe.
+ */
+async function embed(texts: string[], cfg: EmbedConfig): Promise<Float64Array[]> {
+  const ns = `${cfg.method}:${cfg.model}`;
+  const cache: Cache = cfg.cachePath ? loadCache(cfg.cachePath) : {};
+  const keys = await Promise.all(texts.map((t) => cacheKey(ns, t)));
+
+  const out = new Array<Float64Array>(texts.length);
+  const missTexts: string[] = [];
+  const missIdx: number[] = [];
+  for (let i = 0; i < texts.length; i++) {
+    const hit = cfg.cachePath ? cache[keys[i]] : undefined;
+    if (hit) out[i] = unit(hit);
+    else { missTexts.push(texts[i] || " "); missIdx.push(i); }
+  }
+
+  const hits = texts.length - missTexts.length;
+  if (cfg.cachePath && hits > 0) console.error(`  cache: ${hits}/${texts.length} hit`);
+
+  if (missTexts.length > 0) {
+    console.error(`  embedding ${missTexts.length} note(s) via ${cfg.method} (${cfg.model})...`);
+    const provider = createOpenAICompatible({
+      name: cfg.method,
+      baseURL: cfg.baseUrl,
+      apiKey: cfg.apiKey,
+    });
+    let embeddings: number[][];
+    try {
+      const res = await embedMany({
+        model: provider.embeddingModel(cfg.model),
+        values: missTexts,
+      });
+      embeddings = res.embeddings as number[][];
+    } catch (e) {
+      die(`Embedding request failed (${cfg.method} @ ${cfg.baseUrl}): ${(e as Error).message}`);
+    }
+    for (let k = 0; k < missIdx.length; k++) {
+      out[missIdx[k]] = unit(embeddings[k]);
+      if (cfg.cachePath) cache[keys[missIdx[k]]] = embeddings[k];
+    }
+    if (cfg.cachePath) saveCache(cfg.cachePath, cache);
+  }
+
+  return out;
 }
 
 function densePairs(
@@ -337,6 +491,10 @@ function densePairs(
 async function main() {
   const args = parseArgs(Deno.args);
 
+  // Resolve (and validate) the embedding backend up front so a missing key or
+  // bad config fails before we touch Anki.
+  const embedCfg = args.method === "tfidf" ? null : resolveEmbedConfig(args);
+
   await anki<number>(args.ankiUrl, "version"); // health check
 
   console.error(`Finding notes: ${args.query}`);
@@ -349,12 +507,12 @@ async function main() {
   const texts = notes.map(noteToText);
 
   let pairs: [number, number, number][];
-  if (args.method === "openai") {
-    const vectors = await embed(texts, args.model);
-    pairs = densePairs(vectors, args.target);
-  } else {
+  if (embedCfg === null) {
     const vectors = tfidfVectors(texts);
     pairs = tfidfPairs(vectors, args.target);
+  } else {
+    const vectors = await embed(texts, embedCfg);
+    pairs = densePairs(vectors, args.target);
   }
 
   pairs.sort((p, q) => q[2] - p[2]);
