@@ -3,8 +3,9 @@
  * dedupe.ts — Vector-index an Anki deck and surface near-duplicate note pairs.
  *
  * Pulls every note in a deck (or matching an Anki search query) from
- * AnkiConnect, builds a vector for each note, computes pairwise cosine
- * similarity, and prints every pair scoring at or above a target threshold.
+ * AnkiConnect (via the yanki-connect client), builds a vector for each note,
+ * computes pairwise cosine similarity, and prints every pair scoring at or
+ * above a target threshold.
  *
  * The script only *surfaces candidates* — it does not decide what is a
  * duplicate. That final judgment is left to Claude Code, which inspects the
@@ -13,14 +14,15 @@
  * Vectorization backends (--method):
  *   tfidf  (default) — TF-IDF over word uni/bigrams. Zero setup, fully local,
  *                      great at catching reworded / near-identical cards.
- *   ollama           — Local semantic embeddings via Ollama's OpenAI-compatible
- *                      endpoint (http://localhost:11434/v1). No API key needed.
- *   openai           — Semantic embeddings via the OpenAI API. Needs OPENAI_API_KEY.
- *   openrouter       — Semantic embeddings via OpenRouter. Needs OPENROUTER_API_KEY.
+ *   ollama           — Local semantic embeddings via ai-sdk-ollama. No API key.
+ *   openai           — Semantic embeddings via @ai-sdk/openai. Needs OPENAI_API_KEY.
+ *   openrouter       — Semantic embeddings via @openrouter/ai-sdk-provider.
+ *                      Needs OPENROUTER_API_KEY.
  *
- * The last three all speak the OpenAI /v1/embeddings protocol; they differ only
- * in default base URL, default model, and which env var holds the key. Override
- * any of it with --base-url / --model / --api-key-env.
+ * Embeddings go through the Vercel AI SDK (`ai`), one dedicated provider package
+ * per backend — each knows its own base URL and API-key env, so there is no
+ * hand-maintained endpoint table. Override with --base-url / --model /
+ * --api-key-env when you need a non-default host, model, or key source.
  *
  * Usage:
  *   deno run -A dedupe.ts --deck "Spanish::Vocab" --target 0.8
@@ -28,192 +30,107 @@
  *   deno run -A dedupe.ts --deck "Spanish" --method ollama --target 0.88
  *   deno run -A dedupe.ts --deck "Spanish" --method openrouter --model openai/text-embedding-3-small
  *
- * Flags:
- *   --deck <name>       Deck to scan (quoted). Shorthand for --query 'deck:"<name>"'.
- *   --query <query>     Raw Anki search query (overrides --deck).
- *   --target <float>    Similarity threshold in [0,1]. Default 0.80.
- *   --method <name>     tfidf | ollama | openai | openrouter. Default tfidf.
- *   --top <int>         Cap output to the N highest-scoring pairs.
- *   --max-snippet <n>   Chars of note text shown per side in text output. Default 160.
- *   --anki-url <url>    AnkiConnect endpoint. Default http://localhost:8765.
- *   --model <name>      Embedding model. Defaults per method (see below).
- *   --base-url <url>    Override the embeddings endpoint base (…/v1).
- *   --api-key-env <var> Env var to read the API key from. Default per method.
- *   --cache <path>      Embedding cache file. Default ~/.cache/anki-dedupe/embeddings.json.
- *   --no-cache          Disable the embedding cache (always re-embed).
- *   --json              Emit JSON only (for programmatic consumption by Claude).
- *   --help              Show this help.
+ * Run with --help for the full, Cliffy-generated flag list.
  *
- * Caching: embedding vectors are cached on disk keyed by a hash of
- * "<method>:<model>" + note text, so re-running only embeds notes that are new
- * or changed. TF-IDF needs no cache (it is local and instant).
+ * Per-method defaults (base URL comes from the provider package):
+ *   ollama      key (none)              model nomic-embed-text
+ *   openai      key OPENAI_API_KEY       model text-embedding-3-small
+ *   openrouter  key OPENROUTER_API_KEY   model openai/text-embedding-3-small
  *
- * Per-method defaults:
- *   ollama      base http://localhost:11434/v1   key (none)          model nomic-embed-text
- *   openai      base https://api.openai.com/v1   key OPENAI_API_KEY   model text-embedding-3-small
- *   openrouter  base https://openrouter.ai/api/v1 key OPENROUTER_API_KEY model openai/text-embedding-3-small
+ * Caching: embedding vectors are cached on disk (default
+ * ~/.cache/anki-dedupe/embeddings.json) keyed by a hash of "<method>:<model>" +
+ * note text, so re-running only embeds notes that are new or changed. TF-IDF
+ * needs no cache (it is local and instant).
  *
  * Environment:
  *   OPENAI_API_KEY / OPENROUTER_API_KEY  API key for the chosen method.
- *   <method>_BASE_URL (e.g. OLLAMA_BASE_URL, OPENAI_BASE_URL, OPENROUTER_BASE_URL)
- *                      Override the base URL without a flag.
+ *   OLLAMA_BASE_URL / OPENAI_BASE_URL / OPENROUTER_BASE_URL
+ *                      Override the provider base URL without a flag.
  */
 
+import { Command, EnumType } from "jsr:@cliffy/command@1.0.0-rc.7";
+import { YankiConnect } from "npm:yanki-connect@^4";
 import { embedMany } from "npm:ai@^7";
-import { createOpenAICompatible } from "npm:@ai-sdk/openai-compatible@^3";
+import { createOllama } from "npm:ai-sdk-ollama@^4";
+import { createOpenAI } from "npm:@ai-sdk/openai@^4";
+import { createOpenRouter } from "npm:@openrouter/ai-sdk-provider@^3";
+
+/** The embedding-model type that `embedMany` accepts, derived from the SDK. */
+type EmbeddingModel = Parameters<typeof embedMany>[0]["model"];
 
 // ---------------------------------------------------------------------------
-// Provider presets — the embedding methods all speak the OpenAI /v1/embeddings
-// protocol and differ only in these three fields.
+// Embedding providers — one dedicated AI SDK provider package per backend.
+// Each provider package owns its default base URL and API-key handling; here we
+// only record the per-method default model, the key env var, and a factory that
+// builds an embedding model (applying --base-url / --api-key-env overrides).
 // ---------------------------------------------------------------------------
 
 type Method = "tfidf" | "ollama" | "openai" | "openrouter";
 type EmbedMethod = Exclude<Method, "tfidf">;
 
-interface Preset {
-  baseUrl: string;
-  baseUrlEnv: string;
+interface ProviderSpec {
+  defaultModel: string;
   keyEnv: string | null; // null ⇒ no API key required (Ollama)
-  model: string;
+  baseUrlEnv: string;
+  make(model: string, opts: { apiKey?: string; baseURL?: string }): EmbeddingModel;
 }
 
-const PRESETS: Record<EmbedMethod, Preset> = {
+const PROVIDERS: Record<EmbedMethod, ProviderSpec> = {
   ollama: {
-    baseUrl: "http://localhost:11434/v1",
-    baseUrlEnv: "OLLAMA_BASE_URL",
+    defaultModel: "nomic-embed-text",
     keyEnv: null,
-    model: "nomic-embed-text",
+    baseUrlEnv: "OLLAMA_BASE_URL",
+    make: (model, o) => createOllama(o).textEmbeddingModel(model),
   },
   openai: {
-    baseUrl: "https://api.openai.com/v1",
-    baseUrlEnv: "OPENAI_BASE_URL",
+    defaultModel: "text-embedding-3-small",
     keyEnv: "OPENAI_API_KEY",
-    model: "text-embedding-3-small",
+    baseUrlEnv: "OPENAI_BASE_URL",
+    make: (model, o) => createOpenAI(o).textEmbeddingModel(model),
   },
   openrouter: {
-    baseUrl: "https://openrouter.ai/api/v1",
-    baseUrlEnv: "OPENROUTER_BASE_URL",
+    defaultModel: "openai/text-embedding-3-small",
     keyEnv: "OPENROUTER_API_KEY",
-    model: "openai/text-embedding-3-small",
+    baseUrlEnv: "OPENROUTER_BASE_URL",
+    make: (model, o) => createOpenRouter(o).textEmbeddingModel(model),
   },
 };
 
 // ---------------------------------------------------------------------------
-// Argument parsing
+// Errors
 // ---------------------------------------------------------------------------
 
-interface Args {
-  deck?: string;
-  query?: string;
-  target: number;
-  method: Method;
-  top?: number;
-  maxSnippet: number;
-  ankiUrl: string;
-  model?: string;      // undefined ⇒ use the method's preset default
-  baseUrl?: string;    // undefined ⇒ preset default / env
-  apiKeyEnv?: string;  // undefined ⇒ preset default
-  cache: boolean;
-  cachePath?: string;  // undefined ⇒ default path
-  json: boolean;
-}
-
-function parseArgs(argv: string[]): Args {
-  const a: Args = {
-    target: 0.8,
-    method: "tfidf",
-    maxSnippet: 160,
-    ankiUrl: "http://localhost:8765",
-    cache: true,
-    json: false,
-  };
-  const methods: Method[] = ["tfidf", "ollama", "openai", "openrouter"];
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i];
-    const next = () => {
-      const v = argv[++i];
-      if (v === undefined) die(`Missing value for ${arg}`);
-      return v;
-    };
-    switch (arg) {
-      case "--deck": a.deck = next(); break;
-      case "--query": a.query = next(); break;
-      case "--target": a.target = Number(next()); break;
-      case "--method": {
-        const m = next();
-        if (!methods.includes(m as Method)) {
-          die(`Unknown --method: ${m}. Use one of: ${methods.join(", ")}.`);
-        }
-        a.method = m as Method;
-        break;
-      }
-      case "--top": a.top = parseInt(next(), 10); break;
-      case "--max-snippet": a.maxSnippet = parseInt(next(), 10); break;
-      case "--anki-url": a.ankiUrl = next(); break;
-      case "--model": a.model = next(); break;
-      case "--base-url": a.baseUrl = next(); break;
-      case "--api-key-env": a.apiKeyEnv = next(); break;
-      case "--cache": a.cache = true; a.cachePath = next(); break;
-      case "--no-cache": a.cache = false; break;
-      case "--json": a.json = true; break;
-      case "--help": case "-h": printHelpAndExit(); break;
-      default: die(`Unknown argument: ${arg}`);
-    }
-  }
-  if (!a.query && !a.deck) die("Provide --deck <name> or --query <anki-query>.");
-  if (!a.query && a.deck) a.query = `deck:"${a.deck}"`;
-  if (!(a.target >= 0 && a.target <= 1)) die("--target must be between 0 and 1.");
-  return a;
-}
-
-function die(msg: string): never {
+/** Print an error to stderr and exit non-zero. */
+function fail(msg: string): never {
   console.error(`error: ${msg}`);
   console.error("Run with --help for usage.");
   Deno.exit(2);
 }
 
-function printHelpAndExit(): never {
-  // The leading block comment is the canonical help text.
-  const src = new URL(import.meta.url);
-  try {
-    const text = Deno.readTextFileSync(src);
-    const doc = text.match(/\/\*\*([\s\S]*?)\*\//);
-    if (doc) console.log(doc[1].replace(/^\s*\* ?/gm, "").trim());
-  } catch {
-    console.log("dedupe.ts — see file header for usage.");
-  }
-  Deno.exit(0);
-}
-
 // ---------------------------------------------------------------------------
-// AnkiConnect
+// AnkiConnect (via yanki-connect)
 // ---------------------------------------------------------------------------
 
-async function anki<T>(url: string, action: string, params: unknown = {}): Promise<T> {
-  let resp: Response;
-  try {
-    resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, version: 6, params }),
-    });
-  } catch (e) {
-    die(
-      `Cannot reach AnkiConnect at ${url}. Is Anki running with the AnkiConnect ` +
-      `add-on installed (code 2055492159)?\n  (${(e as Error).message})`,
-    );
-  }
-  if (!resp.ok) die(`AnkiConnect HTTP ${resp.status} for action "${action}".`);
-  const data = await resp.json() as { result: T; error: string | null };
-  if (data.error) die(`AnkiConnect error on "${action}": ${data.error}`);
-  return data.result;
-}
-
-interface NoteInfo {
+/** A note as returned by yanki-connect's notesInfo (subset we use). */
+interface Note {
   noteId: number;
   modelName: string;
   tags: string[];
   fields: Record<string, { value: string; order: number }>;
+}
+
+/** Build a yanki-connect client from an `http://host:port` AnkiConnect URL. */
+function ankiClient(ankiUrl: string): YankiConnect {
+  let host = "http://127.0.0.1";
+  let port = 8765;
+  try {
+    const u = new URL(ankiUrl);
+    host = `${u.protocol}//${u.hostname}`;
+    if (u.port) port = Number(u.port);
+  } catch {
+    fail(`Invalid --anki-url: ${ankiUrl}`);
+  }
+  return new YankiConnect({ host, port });
 }
 
 // ---------------------------------------------------------------------------
@@ -221,7 +138,7 @@ interface NoteInfo {
 // ---------------------------------------------------------------------------
 
 /** Strip HTML tags, cloze markup, and media refs; collapse whitespace. */
-function noteToText(note: NoteInfo): string {
+function noteToText(note: Note): string {
   const parts = Object.values(note.fields)
     .sort((x, y) => x.order - y.order)
     .map((f) => f.value);
@@ -345,36 +262,32 @@ function tfidfPairs(
 }
 
 // ---------------------------------------------------------------------------
-// Semantic embeddings (Ollama / OpenAI / OpenRouter) via the Vercel AI SDK,
-// with an on-disk cache + dense cosine similarity.
+// Semantic embeddings via the AI SDK, with an on-disk cache + dense cosine.
 // ---------------------------------------------------------------------------
 
 interface EmbedConfig {
   method: EmbedMethod;
-  baseUrl: string;
   model: string;
   apiKey?: string;
+  baseURL?: string;
   cachePath?: string; // undefined ⇒ caching disabled
 }
 
-/** Resolve flags + env + presets into a concrete embedding configuration. */
-function resolveEmbedConfig(args: Args): EmbedConfig {
-  const method = args.method as EmbedMethod;
-  const preset = PRESETS[method];
-  const model = args.model ?? preset.model;
-  const baseUrl = (args.baseUrl ?? Deno.env.get(preset.baseUrlEnv) ?? preset.baseUrl)
-    .replace(/\/$/, "");
+/** Resolve flags + env + provider defaults into a concrete embed config. */
+function resolveEmbedConfig(opts: Options): EmbedConfig {
+  const method = opts.method as EmbedMethod;
+  const spec = PROVIDERS[method];
+  const model = opts.model ?? spec.defaultModel;
+  const baseURL = opts.baseUrl ?? Deno.env.get(spec.baseUrlEnv) ?? undefined;
 
-  const keyEnv = args.apiKeyEnv ?? preset.keyEnv;
+  const keyEnv = opts.apiKeyEnv ?? spec.keyEnv;
   const apiKey = keyEnv ? Deno.env.get(keyEnv) ?? undefined : undefined;
   if (keyEnv && !apiKey) {
-    die(`--method ${method} needs an API key. Set ${keyEnv} (or pass --api-key-env).`);
+    fail(`--method ${method} needs an API key. Set ${keyEnv} (or pass --api-key-env).`);
   }
 
-  let cachePath: string | undefined;
-  if (args.cache) cachePath = args.cachePath ?? defaultCachePath();
-
-  return { method, baseUrl, model, apiKey, cachePath };
+  const cachePath = opts.cache ? (opts.cacheFile ?? defaultCachePath()) : undefined;
+  return { method, model, apiKey, baseURL, cachePath };
 }
 
 function defaultCachePath(): string {
@@ -384,7 +297,7 @@ function defaultCachePath(): string {
 
 /** Stable cache key for a (namespace, text) pair. */
 async function cacheKey(ns: string, text: string): Promise<string> {
-  const bytes = new TextEncoder().encode(`${ns}\u0000${text}`);
+  const bytes = new TextEncoder().encode(`${ns}\n${text}`);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
 }
@@ -420,7 +333,7 @@ function unit(raw: number[]): Float64Array {
 
 /**
  * Embed texts, reusing cached vectors and only calling the provider for cache
- * misses. Cached vectors are keyed by SHA-256 of "<method>:<model>\0<text>", so
+ * misses. Cached vectors are keyed by SHA-256 of "<method>:<model>" + text, so
  * unchanged notes are never re-embedded and switching model/provider is safe.
  */
 async function embed(texts: string[], cfg: EmbedConfig): Promise<Float64Array[]> {
@@ -442,20 +355,16 @@ async function embed(texts: string[], cfg: EmbedConfig): Promise<Float64Array[]>
 
   if (missTexts.length > 0) {
     console.error(`  embedding ${missTexts.length} note(s) via ${cfg.method} (${cfg.model})...`);
-    const provider = createOpenAICompatible({
-      name: cfg.method,
-      baseURL: cfg.baseUrl,
+    const model = PROVIDERS[cfg.method].make(cfg.model, {
       apiKey: cfg.apiKey,
+      baseURL: cfg.baseURL,
     });
     let embeddings: number[][];
     try {
-      const res = await embedMany({
-        model: provider.embeddingModel(cfg.model),
-        values: missTexts,
-      });
+      const res = await embedMany({ model, values: missTexts });
       embeddings = res.embeddings as number[][];
     } catch (e) {
-      die(`Embedding request failed (${cfg.method} @ ${cfg.baseUrl}): ${(e as Error).message}`);
+      fail(`Embedding request failed (${cfg.method}, model ${cfg.model}): ${(e as Error).message}`);
     }
     for (let k = 0; k < missIdx.length; k++) {
       out[missIdx[k]] = unit(embeddings[k]);
@@ -485,44 +394,75 @@ function densePairs(
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Core run
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const args = parseArgs(Deno.args);
+interface Options {
+  deck?: string;
+  query?: string;
+  target: number;
+  method: Method;
+  top?: number;
+  maxSnippet: number;
+  ankiUrl: string;
+  model?: string;
+  baseUrl?: string;
+  apiKeyEnv?: string;
+  cache: boolean;      // false when --no-cache
+  cacheFile?: string;
+  json: boolean;
+}
+
+async function run(opts: Options) {
+  if (!(opts.target >= 0 && opts.target <= 1)) fail("--target must be between 0 and 1.");
+  const query = opts.query ?? (opts.deck ? `deck:"${opts.deck}"` : undefined);
+  if (!query) fail("Provide --deck <name> or --query <anki-query>.");
 
   // Resolve (and validate) the embedding backend up front so a missing key or
   // bad config fails before we touch Anki.
-  const embedCfg = args.method === "tfidf" ? null : resolveEmbedConfig(args);
+  const embedCfg = opts.method === "tfidf" ? null : resolveEmbedConfig(opts);
 
-  await anki<number>(args.ankiUrl, "version"); // health check
+  const client = ankiClient(opts.ankiUrl);
+  try {
+    await client.miscellaneous.version(); // health check
+  } catch (e) {
+    fail(
+      `Cannot reach AnkiConnect at ${opts.ankiUrl}. Is Anki running with the ` +
+      `AnkiConnect add-on installed (code 2055492159)?\n  (${(e as Error).message})`,
+    );
+  }
 
-  console.error(`Finding notes: ${args.query}`);
-  const noteIds = await anki<number[]>(args.ankiUrl, "findNotes", { query: args.query });
-  if (noteIds.length === 0) die(`No notes match: ${args.query}`);
-  if (noteIds.length === 1) die("Only one note matched — nothing to compare.");
-  console.error(`Found ${noteIds.length} notes. Vectorizing with "${args.method}"...`);
+  console.error(`Finding notes: ${query}`);
+  let noteIds: number[];
+  try {
+    noteIds = await client.note.findNotes({ query });
+  } catch (e) {
+    fail(`AnkiConnect findNotes failed: ${(e as Error).message}`);
+  }
+  if (noteIds.length === 0) fail(`No notes match: ${query}`);
+  if (noteIds.length === 1) fail("Only one note matched — nothing to compare.");
+  console.error(`Found ${noteIds.length} notes. Vectorizing with "${opts.method}"...`);
 
-  const notes = await anki<NoteInfo[]>(args.ankiUrl, "notesInfo", { notes: noteIds });
+  const notes = await client.note.notesInfo({ notes: noteIds }) as Note[];
   const texts = notes.map(noteToText);
 
   let pairs: [number, number, number][];
   if (embedCfg === null) {
     const vectors = tfidfVectors(texts);
-    pairs = tfidfPairs(vectors, args.target);
+    pairs = tfidfPairs(vectors, opts.target);
   } else {
     const vectors = await embed(texts, embedCfg);
-    pairs = densePairs(vectors, args.target);
+    pairs = densePairs(vectors, opts.target);
   }
 
   pairs.sort((p, q) => q[2] - p[2]);
-  if (args.top !== undefined) pairs = pairs.slice(0, args.top);
+  if (opts.top !== undefined) pairs = pairs.slice(0, opts.top);
 
   const result = {
-    deck: args.deck ?? null,
-    query: args.query,
-    method: args.method,
-    target: args.target,
+    deck: opts.deck ?? null,
+    query,
+    method: opts.method,
+    target: opts.target,
     noteCount: notes.length,
     pairCount: pairs.length,
     pairs: pairs.map(([i, j, sim]) => ({
@@ -532,7 +472,7 @@ async function main() {
     })),
   };
 
-  if (args.json) {
+  if (opts.json) {
     console.log(JSON.stringify(result, null, 2));
     return;
   }
@@ -544,7 +484,7 @@ async function main() {
   console.log(`Notes      : ${result.noteCount}`);
   console.log(`Candidate pairs above target: ${result.pairCount}`);
   console.log("─".repeat(72));
-  const clip = (s: string) => s.length > args.maxSnippet ? s.slice(0, args.maxSnippet) + "…" : s;
+  const clip = (s: string) => s.length > opts.maxSnippet ? s.slice(0, opts.maxSnippet) + "…" : s;
   result.pairs.forEach((p, idx) => {
     console.log(`\n[${idx + 1}] similarity ${p.similarity}`);
     console.log(`  A (note ${p.a.noteId}): ${clip(p.a.text)}`);
@@ -559,4 +499,30 @@ async function main() {
   console.log("JSON_RESULT_END");
 }
 
-if (import.meta.main) await main();
+// ---------------------------------------------------------------------------
+// CLI (Cliffy)
+// ---------------------------------------------------------------------------
+
+function cli() {
+  const methodType = new EnumType(["tfidf", "ollama", "openai", "openrouter"]);
+  return new Command()
+    .name("dedupe")
+    .description("Vector-index an Anki deck and surface near-duplicate note pairs.")
+    .type("method", methodType)
+    .option("--deck <name:string>", "Deck to scan (quoted). Shorthand for --query 'deck:\"<name>\"'.")
+    .option("--query <query:string>", "Raw Anki search query (overrides --deck).")
+    .option("--target <target:number>", "Similarity threshold in [0,1]; report pairs ≥ this.", { default: 0.8 })
+    .option("--method <method:method>", "tfidf | ollama | openai | openrouter.", { default: "tfidf" })
+    .option("--model <name:string>", "Embedding model (semantic methods). Defaults per method.")
+    .option("--base-url <url:string>", "Override the provider base URL.")
+    .option("--api-key-env <var:string>", "Env var to read the API key from. Defaults per method.")
+    .option("--cache-file <path:string>", "Embedding cache file. Default ~/.cache/anki-dedupe/embeddings.json.")
+    .option("--no-cache", "Disable the embedding cache (always re-embed).")
+    .option("--top <n:integer>", "Cap output to the N highest-scoring pairs.")
+    .option("--max-snippet <n:integer>", "Chars of note text shown per side in text output.", { default: 160 })
+    .option("--anki-url <url:string>", "AnkiConnect endpoint.", { default: "http://127.0.0.1:8765" })
+    .option("--json", "Emit JSON only (for programmatic consumption by Claude).", { default: false })
+    .action((opts) => run(opts as unknown as Options));
+}
+
+if (import.meta.main) await cli().parse(Deno.args);

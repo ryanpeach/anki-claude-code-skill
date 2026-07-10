@@ -27,8 +27,10 @@ Claude.
 - **Anki desktop running** with the AnkiConnect add-on (code `2055492159`),
   listening on `http://localhost:8765`.
 - **Deno installed** (`https://deno.land`) to run the indexing script. On first
-  run Deno auto-downloads the Vercel AI SDK from npm — this needs network access
-  once and is then cached.
+  run Deno auto-downloads its dependencies — [Cliffy](https://cliffy.io) (arg
+  parsing), [yanki-connect](https://github.com/kitschpatrol/yanki-connect)
+  (AnkiConnect client), and the [Vercel AI SDK](https://www.npmjs.com/package/ai)
+  with its provider packages — this needs network access once and is then cached.
 - For a semantic method, one of:
   - **`ollama`** — [Ollama](https://ollama.com) running locally with an
     embedding model pulled (`ollama pull nomic-embed-text`). No API key.
@@ -54,23 +56,26 @@ Key flags (`--help` for the full list):
 | `--target <float>` | Similarity threshold in `[0,1]`. Report pairs `≥` this. | `0.80` |
 | `--method <name>` | `tfidf` \| `ollama` \| `openai` \| `openrouter`. | `tfidf` |
 | `--model <name>` | Embedding model (semantic methods). | per method |
-| `--base-url <url>` | Override the embeddings endpoint base (`…/v1`). | per method |
+| `--base-url <url>` | Override the provider base URL. | per method |
 | `--api-key-env <var>` | Env var holding the API key. | per method |
-| `--cache <path>` | Embedding cache file. | `~/.cache/anki-dedupe/…` |
+| `--cache-file <path>` | Embedding cache file. | `~/.cache/anki-dedupe/…` |
 | `--no-cache` | Disable the embedding cache. | off |
 | `--top <int>` | Cap output to the N highest-scoring pairs. | all |
 | `--json` | Emit JSON only. | off |
 
-**Methods** — all vendor-agnostic via the [Vercel AI SDK](https://www.npmjs.com/package/ai)
-(`ai` + `@ai-sdk/openai-compatible`), so any OpenAI-compatible embeddings
-endpoint works:
+**Methods** — semantic embeddings go through the [Vercel AI SDK](https://www.npmjs.com/package/ai)
+(`ai`), with a dedicated provider package per backend
+([`ai-sdk-ollama`](https://github.com/jagreehal/ai-sdk-ollama),
+[`@ai-sdk/openai`](https://www.npmjs.com/package/@ai-sdk/openai),
+[`@openrouter/ai-sdk-provider`](https://www.npmjs.com/package/@openrouter/ai-sdk-provider)).
+Each provider owns its own base URL and API-key handling:
 
 - **`tfidf`** (default) — TF-IDF over word uni/bigrams, fully local, no API key,
   no model download. Excellent at catching reworded or near-identical cards.
   The right default for almost every deck.
 - **`ollama`** — local semantic embeddings, no API key, nothing leaves the
   machine. Best privacy-preserving semantic option. Default model
-  `nomic-embed-text`, endpoint `http://localhost:11434/v1`.
+  `nomic-embed-text`.
 - **`openai`** — semantic embeddings via the OpenAI API. Default model
   `text-embedding-3-small`.
 - **`openrouter`** — semantic embeddings via OpenRouter. Default model
@@ -81,14 +86,14 @@ that share few literal words (e.g. "What ends a cell's life?" vs. "Define
 apoptosis"). Prefer `ollama` when the user cares about privacy or cost; the
 hosted methods need a key.
 
-Per-method defaults (all overridable with `--base-url` / `--model` /
-`--api-key-env`, or the `<METHOD>_BASE_URL` env vars):
+Per-method defaults (base URL is the provider's own default; override with
+`--base-url` / `--model` / `--api-key-env`, or the `<METHOD>_BASE_URL` env vars):
 
-| Method | Base URL | Key env | Default model |
-|--------|----------|---------|---------------|
-| `ollama` | `http://localhost:11434/v1` | (none) | `nomic-embed-text` |
-| `openai` | `https://api.openai.com/v1` | `OPENAI_API_KEY` | `text-embedding-3-small` |
-| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `openai/text-embedding-3-small` |
+| Method | Key env | Default model |
+|--------|---------|---------------|
+| `ollama` | (none) | `nomic-embed-text` |
+| `openai` | `OPENAI_API_KEY` | `text-embedding-3-small` |
+| `openrouter` | `OPENROUTER_API_KEY` | `openai/text-embedding-3-small` |
 
 **Caching.** Semantic embeddings are cached on disk (default
 `~/.cache/anki-dedupe/embeddings.json`), keyed by a hash of `<method>:<model>`
@@ -216,7 +221,7 @@ See `../anki/reference/ankiconnect-api.md` for full request/response shapes.
 | No pairs above target | "No duplicates at ≥ `<target>`. Lower the target to cast a wider net?" |
 | `openai`/`openrouter`, no key | The script exits with which env var to set. Offer to fall back to `tfidf` (no key) or `ollama` (local). |
 | `ollama` chosen, not running | The script reports the connection failure. Suggest `ollama serve` + `ollama pull nomic-embed-text`, or fall back to `tfidf`. |
-| First `deno run` blocked offline | The AI SDK download needs network once. For fully offline use, stick to `--method tfidf`. |
+| First `deno run` blocked offline | Deno's dependency download (Cliffy, yanki-connect, AI SDK) needs network once. For fully offline use, stick to `--method tfidf`. |
 
 ## Notes on Method
 
@@ -228,10 +233,11 @@ See `../anki/reference/ankiconnect-api.md` for full request/response shapes.
 - **Text is normalized** before vectorizing: HTML tags stripped, cloze
   `{{c1::…}}` reduced to its answer text, `[sound:…]` and `<img>` refs removed,
   HTML entities decoded. So cards compare on meaning, not markup.
-- **Vendor-agnostic embeddings.** The semantic methods go through the Vercel AI
-  SDK's OpenAI-compatible provider, so `ollama`, `openai`, and `openrouter` are
-  just different base URLs + keys. Any other OpenAI-compatible endpoint works
-  too: `--method openai --base-url <url> --api-key-env <VAR> --model <name>`.
+- **Built on the AI SDK.** The semantic methods use the Vercel AI SDK (`ai`) with
+  a dedicated provider package per backend (`ai-sdk-ollama`, `@ai-sdk/openai`,
+  `@openrouter/ai-sdk-provider`); each knows its own base URL and API-key env, so
+  there is no hand-maintained endpoint table. Point any of them at a different
+  host with `--base-url` / a different key source with `--api-key-env`.
 - **Caching keeps repeat runs cheap.** Only new or edited notes are re-embedded;
   everything else is read from the on-disk cache. This matters most for paid
   APIs (`openai`/`openrouter`) — a re-audit after adding a few cards costs only

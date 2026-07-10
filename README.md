@@ -47,11 +47,11 @@ The `dedupe` skill additionally needs [Deno](https://deno.land) installed to run
 The `dedupe` skill finds repeated cards. A [Deno](https://deno.land) script vector-indexes the deck, computes pairwise cosine similarity, and surfaces every note pair scoring at or above a **target** you choose (default `0.80`). Claude then reads each candidate pair and makes the final call — true duplicate, intentional reverse card, overlapping-but-distinct, or false positive — and offers to delete, suspend, or merge the redundant note (never without your confirmation).
 
 - **Local by default** — TF-IDF vectorization runs entirely on your machine, no API key, no model download.
-- **Vendor-agnostic semantic mode** — for paraphrases that share few literal words, switch to real embeddings via the [Vercel AI SDK](https://www.npmjs.com/package/ai). Pick your provider:
-  - `--method ollama` — local, private, no key ([Ollama](https://ollama.com), default model `nomic-embed-text`)
-  - `--method openai` — needs `OPENAI_API_KEY`
-  - `--method openrouter` — needs `OPENROUTER_API_KEY`
-  - or any other OpenAI-compatible endpoint via `--base-url` / `--api-key-env` / `--model`
+- **Semantic mode** — for paraphrases that share few literal words, switch to real embeddings via the [Vercel AI SDK](https://www.npmjs.com/package/ai), with a dedicated provider package per backend. Pick your provider:
+  - `--method ollama` — local, private, no key ([ai-sdk-ollama](https://github.com/jagreehal/ai-sdk-ollama), default model `nomic-embed-text`)
+  - `--method openai` — [@ai-sdk/openai](https://www.npmjs.com/package/@ai-sdk/openai), needs `OPENAI_API_KEY`
+  - `--method openrouter` — [@openrouter/ai-sdk-provider](https://www.npmjs.com/package/@openrouter/ai-sdk-provider), needs `OPENROUTER_API_KEY`
+  - point any of them at a custom host via `--base-url` / `--api-key-env` / `--model`
 - **Cached** — embeddings are cached on disk keyed by note text, so re-auditing a deck only embeds new or changed cards (fast, and nearly free on paid APIs). `--no-cache` to disable.
 - **Markup-aware** — HTML, cloze `{{c1::…}}`, and media refs are stripped before comparison, so cards match on meaning.
 
@@ -63,7 +63,7 @@ deno run -A .claude/skills/dedupe/scripts/dedupe.ts --deck Spanish::Vocab --meth
 
 ## How it works
 
-The `anki` skill talks to Anki's REST API (AnkiConnect on `localhost:8765`) using `curl`. No Python packages, no CLI binary, no dependencies beyond Anki + AnkiConnect. The `dedupe` skill adds one dependency — Deno — to run its indexing script.
+The `anki` skill talks to Anki's REST API (AnkiConnect on `localhost:8765`) using `curl`. No Python packages, no CLI binary, no dependencies beyond Anki + AnkiConnect. The `dedupe` skill adds Deno to run its indexing script; that script leans on established libraries — [Cliffy](https://cliffy.io) for arg parsing, [yanki-connect](https://github.com/kitschpatrol/yanki-connect) as a typed AnkiConnect client, and the [Vercel AI SDK](https://www.npmjs.com/package/ai) with per-provider packages for embeddings — all fetched by Deno on first run.
 
 Cards are generated following evidence-based principles:
 
